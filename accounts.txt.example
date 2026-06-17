@@ -1,0 +1,6 @@
+# One AWS account ID per line. Copy to accounts.txt — it is gitignored.
+# Lines starting with # are ignored.
+
+123456789012
+234567890123
+345678901234
