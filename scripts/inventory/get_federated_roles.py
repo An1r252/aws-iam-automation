@@ -4,16 +4,14 @@ Inventories all IAM roles with federated trust policies across multiple AWS acco
 Assumes the role 'aws-readonly-role' in each account and outputs a CSV report.
 
 Usage:
-    python get_federated_roles.py --accounts accounts.txt --output federated_roles.csv
-    python get_federated_roles.py --accounts accounts.txt  # prints to stdout
+    python get_federated_roles.py --accounts accounts.txt --profile my-gimme-profile --output federated_roles.csv
+    python get_federated_roles.py --accounts accounts.txt --profile my-gimme-profile
 """
 
 import argparse
 import boto3
 import csv
-import json
 import sys
-from datetime import datetime, timezone
 from botocore.exceptions import ClientError
 
 
@@ -21,9 +19,22 @@ ASSUME_ROLE_NAME = "aws-readonly-role"
 SESSION_NAME = "federated-role-inventory"
 
 
-def assume_role(account_id: str) -> boto3.Session:
-    sts = boto3.client("sts")
-    role_arn = f"arn:aws:iam::{account_id}:role/{ASSUME_ROLE_NAME}"
+def get_base_session(profile: str) -> boto3.Session:
+    """Returns a boto3 session using the specified gimme-aws-creds profile."""
+    session = boto3.Session(profile_name=profile)
+    # Validate the session works before proceeding
+    sts = session.client("sts")
+    identity = sts.get_caller_identity()
+    print(
+        f"Logged in as: {identity['Arn']} (account: {identity['Account']})",
+        file=sys.stderr,
+    )
+    return session
+
+
+def assume_role(base_session: boto3.Session, account_id: str) -> boto3.Session:
+    sts = base_session.client("sts")
+    role_arn = "arn:aws:iam::{}:role/{}".format(account_id, ASSUME_ROLE_NAME)
     response = sts.assume_role(RoleArn=role_arn, RoleSessionName=SESSION_NAME)
     creds = response["Credentials"]
     return boto3.Session(
@@ -41,8 +52,8 @@ def list_all_roles(iam_client) -> list:
     return roles
 
 
-def extract_federated_principals(trust_policy: dict) -> list[dict]:
-    """Returns list of {type, principal} for each federated principal in the trust policy."""
+def extract_federated_principals(trust_policy: dict) -> list:
+    """Returns list of {idp_type, idp_arn} for each federated principal in the trust policy."""
     federated = []
     for statement in trust_policy.get("Statement", []):
         principal = statement.get("Principal", {})
@@ -51,7 +62,12 @@ def extract_federated_principals(trust_policy: dict) -> list[dict]:
                 if key == "Federated":
                     values = [value] if isinstance(value, str) else value
                     for v in values:
-                        idp_type = "SAML" if "saml-provider" in v else "OIDC" if "oidc-provider" in v else "Unknown"
+                        if "saml-provider" in v:
+                            idp_type = "SAML"
+                        elif "oidc-provider" in v:
+                            idp_type = "OIDC"
+                        else:
+                            idp_type = "Unknown"
                         federated.append({"idp_type": idp_type, "idp_arn": v})
     return federated
 
@@ -69,14 +85,14 @@ def get_role_last_used(iam_client, role_name: str) -> dict:
         return {"last_used_date": "Unknown", "last_used_region": "Unknown"}
 
 
-def inventory_account(account_id: str) -> list[dict]:
-    print(f"  Processing account {account_id}...", file=sys.stderr)
+def inventory_account(base_session: boto3.Session, account_id: str) -> list:
+    print("  Processing account {}...".format(account_id), file=sys.stderr)
     try:
-        session = assume_role(account_id)
+        session = assume_role(base_session, account_id)
         iam = session.client("iam")
         roles = list_all_roles(iam)
     except ClientError as e:
-        print(f"  [WARN] Could not access account {account_id}: {e}", file=sys.stderr)
+        print("  [WARN] Could not access account {}: {}".format(account_id, e), file=sys.stderr)
         return []
 
     rows = []
@@ -101,24 +117,31 @@ def inventory_account(account_id: str) -> list[dict]:
                 "path":             role["Path"],
             })
 
-    print(f"  Found {len(rows)} federated role(s) in {account_id}", file=sys.stderr)
+    print("  Found {} federated role(s) in {}".format(len(rows), account_id), file=sys.stderr)
     return rows
 
 
 def main():
     parser = argparse.ArgumentParser(description="Inventory federated IAM roles across AWS accounts")
     parser.add_argument("--accounts", required=True, help="Path to file with one account ID per line")
+    parser.add_argument("--profile", required=True, help="AWS profile name from gimme-aws-creds (~/.aws/credentials)")
     parser.add_argument("--output", help="Output CSV file path (default: stdout)")
     args = parser.parse_args()
+
+    try:
+        base_session = get_base_session(args.profile)
+    except Exception as e:
+        print("[ERROR] Could not authenticate with profile '{}': {}".format(args.profile, e), file=sys.stderr)
+        sys.exit(1)
 
     with open(args.accounts) as f:
         account_ids = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
-    print(f"Scanning {len(account_ids)} account(s)...", file=sys.stderr)
+    print("Scanning {} account(s)...".format(len(account_ids)), file=sys.stderr)
 
     all_rows = []
     for account_id in account_ids:
-        all_rows.extend(inventory_account(account_id))
+        all_rows.extend(inventory_account(base_session, account_id))
 
     fieldnames = ["account_id", "role_name", "role_arn", "idp_type", "idp_arn", "last_used_date", "last_used_region", "created_date", "path"]
 
@@ -129,9 +152,9 @@ def main():
 
     if args.output:
         output.close()
-        print(f"\nDone. {len(all_rows)} total federated role(s) written to {args.output}", file=sys.stderr)
+        print("\nDone. {} total federated role(s) written to {}".format(len(all_rows), args.output), file=sys.stderr)
     else:
-        print(f"\nDone. {len(all_rows)} total federated role(s) found.", file=sys.stderr)
+        print("\nDone. {} total federated role(s) found.".format(len(all_rows)), file=sys.stderr)
 
 
 if __name__ == "__main__":
